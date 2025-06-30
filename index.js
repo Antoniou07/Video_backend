@@ -2,15 +2,15 @@ require('dotenv').config();
 const express = require('express');
 const multer = require('multer');
 const ffmpeg = require('fluent-ffmpeg');
-const fs = require('fs');
-const path = require('path');
+const stream = require('stream');
 const { google } = require('googleapis');
 
 const app = express();
 app.use(express.json());
 
-// Multer para manejar subida de archivos
-const upload = multer({ dest: 'uploads/' });
+// Multer en memoria
+const storage = multer.memoryStorage();
+const upload = multer({ storage });
 
 // Configurar Google OAuth2 Client
 const auth = new google.auth.OAuth2(
@@ -21,7 +21,7 @@ const auth = new google.auth.OAuth2(
 auth.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
 const drive = google.drive({ version: 'v3', auth });
 
-// Función para crear carpeta en Drive
+// Crear carpeta en Drive
 async function createDriveFolder(name, parentId) {
   const fileMetadata = {
     name,
@@ -35,15 +35,15 @@ async function createDriveFolder(name, parentId) {
   return folder.data.id;
 }
 
-// Función para subir archivo a carpeta Drive
-async function uploadFileToDrive(filePath, fileName, folderId) {
+// Subir archivo a Drive desde buffer
+async function uploadBufferToDrive(buffer, filename, folderId) {
   const fileMetadata = {
-    name: fileName,
+    name: filename,
     parents: [folderId],
   };
   const media = {
     mimeType: 'image/png',
-    body: fs.createReadStream(filePath),
+    body: stream.Readable.from(buffer),
   };
   const file = await drive.files.create({
     resource: fileMetadata,
@@ -51,7 +51,6 @@ async function uploadFileToDrive(filePath, fileName, folderId) {
     fields: 'id',
   });
 
-  // Hacer archivo público
   await drive.permissions.create({
     fileId: file.data.id,
     requestBody: { role: 'reader', type: 'anyone' },
@@ -65,71 +64,69 @@ async function uploadFileToDrive(filePath, fileName, folderId) {
   return result.data.webContentLink || result.data.webViewLink;
 }
 
-// Endpoint para obtener duración del video
-app.post('/api/duracion', upload.single('video'), (req, res) => {
-  const videoPath = req.file.path;
-  ffmpeg.ffprobe(videoPath, (err, metadata) => {
-    fs.unlinkSync(videoPath);
-    if (err) return res.status(500).json({ error: err.message });
-    res.json({ duration: metadata.format.duration });
-  });
-});
-
-// Endpoint para extraer screenshots y subir a Drive
 app.post('/api/extract', upload.single('video'), async (req, res) => {
-  const videoPath = req.file.path;
-  const { interval = 5, name = 'video' } = req.body;
-
   try {
+    const { interval = 5, name = 'video' } = req.body;
+    const videoBuffer = req.file.buffer;
+
+    // Crear carpeta en Drive
     const baseFolderId = process.env.GOOGLE_DRIVE_FOLDER_ID;
     const folderName = `${name}-${Date.now()}`;
     const folderId = await createDriveFolder(folderName, baseFolderId);
 
-    const outputDir = path.join(__dirname, 'screenshots', folderName);
-    fs.mkdirSync(outputDir, { recursive: true });
-
-    const metadata = await new Promise((resolve, reject) => {
-      ffmpeg.ffprobe(videoPath, (err, data) => {
-        if (err) reject(err);
-        else resolve(data);
+    // Duración del video usando ffprobe desde buffer (usa un truco con stream)
+    const getVideoDuration = () => {
+      return new Promise((resolve, reject) => {
+        const videoStream = stream.Readable.from(videoBuffer);
+        ffmpeg(videoStream)
+          .ffprobe((err, data) => {
+            if (err) reject(err);
+            else resolve(data.format.duration);
+          });
       });
-    });
+    };
 
-    const duration = metadata.format.duration;
+    const duration = await getVideoDuration();
     const count = Math.floor(duration / interval) || 1;
 
-    ffmpeg(videoPath)
-      .on('end', async () => {
-        fs.unlinkSync(videoPath);
+    // Extraer screenshots y subir directamente a Drive
+    const screenshots = [];
+    let screenshotIndex = 0;
 
-        const files = fs.readdirSync(outputDir);
-        const urls = [];
+    // ffmpeg no soporta generar screenshots a buffer directamente, pero podemos extraer frames con
+    // filtros y guardar cada uno en memoria usando evento 'data'.
+    // Para simplificar aquí extraeremos un frame a la vez con delay según interval y subimos cada uno:
 
-        for (const file of files) {
-          const filePath = path.join(outputDir, file);
-          const url = await uploadFileToDrive(filePath, file, folderId);
-          urls.push(url);
-          fs.unlinkSync(filePath);
-        }
+    for (let i = 0; i < count; i++) {
+      const time = i * interval;
+      const buffer = await new Promise((resolve, reject) => {
+        const chunks = [];
+        const videoStream = stream.Readable.from(videoBuffer);
 
-        fs.rmdirSync(outputDir);
-
-        const folderUrl = `https://drive.google.com/drive/folders/${folderId}`;
-
-        res.json({ screenshots: urls, folderUrl });
-      })
-      .on('error', (err) => {
-        fs.unlinkSync(videoPath);
-        res.status(500).json({ error: err.message });
-      })
-      .screenshots({
-        count,
-        folder: outputDir,
-        filename: 'screenshot-%03d.png',
-        size: '640x360',
+        ffmpeg(videoStream)
+          .seekInput(time)
+          .frames(1)
+          .format('image2')
+          .outputOptions('-vframes', '1')
+          .on('error', reject)
+          .on('end', () => {
+            resolve(Buffer.concat(chunks));
+          })
+          .pipe()
+          .on('data', (chunk) => chunks.push(chunk));
       });
+
+      screenshotIndex++;
+      const filename = `screenshot-${String(screenshotIndex).padStart(3, '0')}.png`;
+      const url = await uploadBufferToDrive(buffer, filename, folderId);
+      screenshots.push(url);
+    }
+
+    const folderUrl = `https://drive.google.com/drive/folders/${folderId}`;
+
+    res.json({ screenshots, folderUrl });
   } catch (error) {
-    if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
+    console.error(error);
     res.status(500).json({ error: error.message });
   }
 });
