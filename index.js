@@ -8,6 +8,9 @@ const { google } = require('googleapis');
 const app = express();
 app.use(express.json());
 
+// Evitar error 404 favicon
+app.get('/favicon.ico', (req, res) => res.status(204).end());
+
 // Multer en memoria
 const storage = multer.memoryStorage();
 const upload = multer({ storage });
@@ -92,10 +95,6 @@ app.post('/api/extract', upload.single('video'), async (req, res) => {
     // Extraer screenshots y subir directamente a Drive
     const screenshots = [];
     let screenshotIndex = 0;
-
-    // ffmpeg no soporta generar screenshots a buffer directamente, pero podemos extraer frames con
-    // filtros y guardar cada uno en memoria usando evento 'data'.
-    // Para simplificar aquí extraeremos un frame a la vez con delay según interval y subimos cada uno:
 
     for (let i = 0; i < count; i++) {
       const time = i * interval;
